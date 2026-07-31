@@ -33,12 +33,18 @@ fn main() {
     res.set("OriginalFilename", "serial-term.exe");
     match res.compile() {
         Ok(()) => {
-            // winres 打包为 libresource.a 用 `-l static=resource` 链接，但其中对象
-            // 无被引用符号，链接器不会提取它，导致 .rsrc 被丢弃。
-            // 直接用绝对路径传资源对象并强制包含，确保图标/版本信息嵌入 exe。
+            // winres 在 mingw/gnu 工具链下生成 `resource.o`，并打包为静态库；
+            // 但其中对象无被引用符号，链接器不会提取它，导致 .rsrc 段被丢弃，
+            // 必须用绝对路径直接传该对象并强制包含，图标/版本信息才嵌入 exe。
+            // 而在 MSVC 工具链下 winres 生成 `resource.lib` 并自动通过
+            // `cargo:rustc-link-lib` 链接，资源段由链接器特殊处理（不会被丢弃），
+            // 此时不存在 `resource.o`。若仍强制链接该文件会导致 LNK1181。
+            // 因此仅当 `resource.o` 确实存在（mingw 工具链）时才强制链接。
             let out = std::env::var("OUT_DIR").unwrap_or_default();
-            let res_o = format!("{}/resource.o", out);
-            println!("cargo:rustc-link-arg={}", res_o);
+            let res_o = std::path::Path::new(&out).join("resource.o");
+            if res_o.exists() {
+                println!("cargo:rustc-link-arg={}", res_o.display());
+            }
         }
         Err(e) => panic!("winres 编译资源失败: {}", e),
     }
