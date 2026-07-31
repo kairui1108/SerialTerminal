@@ -65,10 +65,12 @@ jobs:
           path: target/x86_64-pc-windows-gnu/release/serial-term.exe
           if-no-files-found: error
 
-  # 发布 GitHub Release 时：提取版本信息 + 附加 exe
+  # 发布 Release：push v* tag 时自动创建，或手动发布时附加 exe
   release:
     name: Attach binaries to release
-    if: github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')
+    if: >-
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
+      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     needs: build-windows
     permissions:
@@ -78,12 +80,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 统一提取当前 tag 名：release 事件用 release.tag_name，push tag 用 GITHUB_REF
+      - name: Resolve tag name
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
       # 从 RELEASE_NOTE.md 提取对应版本的变更记录（tag v1.0.9 -> [1.0.9] 区块，回退 [Unreleased]）
       - name: Extract release notes
         id: extract
         shell: bash
         run: |
-          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${{ steps.tag.outputs.tag }}"
           VER_NUM="${VERSION#v}"
           python3 - "$VER_NUM" << 'PYEOF'
           import re, sys, os, base64
@@ -127,11 +141,11 @@ jobs:
             echo "$ENC" | base64 --decode > /tmp/release_body.txt
           fi
 
-      # 将 exe 附加到对应 release，并用提取的变更记录作为描述
+      # 将 exe 附加到对应 release（push tag 时自动创建 release），并用变更记录作为描述
       - name: Upload asset to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ steps.tag.outputs.tag }}
           files: release-assets/serial-term.exe
           body_path: /tmp/release_body.txt
           generate_release_notes: false
