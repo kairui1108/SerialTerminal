@@ -1,0 +1,11 @@
+# 统一文本文件行尾为 LF，避免跨平台 diff 噪音
+* text=auto eol=lf
+
+# 二进制文件不进行文本转换
+*.ico binary
+*.png binary
+*.exe binary
+
+# 特定文件按需处理
+*.sh text eol=lf
+*.bat text eol=crlf
