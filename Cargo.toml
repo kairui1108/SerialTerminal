@@ -1,6 +1,6 @@
 [package]
 name = "serial-term"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "跨平台串口终端，可无缝集成 Windows Terminal（Rust 重构版）"
 license = "MIT"
