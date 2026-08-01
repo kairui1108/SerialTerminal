@@ -445,8 +445,11 @@ pub struct Engine {
     follow: bool,
     /// 输出区可视行数（draw 时刷新，用于滚动计算）
     out_height: usize,
-    /// 查看历史时视口顶部的日志行索引（锚点，新数据到达不影响当前位置）
+    /// 查看历史时视口顶部的渲染行索引（向后兼容的滚动游标）
     view_top: usize,
+    /// 锚定模式下的日志行索引（None = 跟随模式）。锚定到具体日志行而非绝对
+    /// 渲染行索引，头部 pop / 折行数变化时内容不漂移，长时间连接滚动不跳动。
+    anchor_line: Option<usize>,
     /// 命令补全：当前 Tab 选中的候选索引
     completion_idx: usize,
     /// 命令补全：上次补全的命令前缀（变化时重置选中）
@@ -597,6 +600,7 @@ impl Engine {
             history,
             hist_pos: 0,
             view_top: 0,
+            anchor_line: None,
             help_open: false,
             help_scroll: 0,
             settings_open: false,
@@ -1214,7 +1218,13 @@ impl Engine {
             }
             // 左键按下但已在锚定模式：无操作
             MouseEventKind::Down(_) => {}
-            MouseEventKind::Drag(_) => {
+            // 左键拖动（跟随模式）：暂停跟随并锚定当前视口，便于选择/查看历史
+            MouseEventKind::Drag(_) if self.follow => {
+                let total = self.render_total();
+                let vis = self.out_height.max(1);
+                let start = total.saturating_sub(vis);
+                self.anchor_line = Some(self.log_line_of(start));
+                self.view_top = start;
                 self.follow = false;
             }
             _ => {}
@@ -1247,6 +1257,12 @@ impl Engine {
             // 的增量补齐判断会失效，导致新行永远不进入 render_rows，输出区卡住
             // 不显示新数据（RX 仍增长），只有 :clear 清空两者才能恢复。
             self.render_rows.pop_front();
+            // 锚定模式：头部 pop 时同步前移日志行锚点，保持锚定的内容不漂移
+            if !self.follow
+                && let Some(anchor) = &mut self.anchor_line
+            {
+                *anchor = anchor.saturating_sub(1);
+            }
         }
         self.dirty = true;
     }
@@ -1412,13 +1428,21 @@ impl Engine {
     /// 之后锚点随滚动移动，新数据到达不影响已锚定的显示位置。
     fn scroll_up(&mut self, step: usize) {
         if self.follow {
-            // 从跟随切换为锚定：锚定在切换瞬间的视口顶部
+            // 从跟随切换为锚定：锚定在切换瞬间的视口顶部（记录日志行索引）
             let total = self.render_total();
             let vis = self.out_height.max(1);
-            self.view_top = total.saturating_sub(vis);
+            let start = total.saturating_sub(vis);
+            self.anchor_line = Some(self.log_line_of(start));
+            self.view_top = start;
             self.follow = false;
         }
-        self.view_top = self.view_top.saturating_sub(step);
+        // 按渲染行步长上移，但锚点始终换算回日志行索引，避免绝对索引漂移
+        if let Some(anchor) = self.anchor_line {
+            let cur = self.render_top_of(anchor);
+            let new_cur = cur.saturating_sub(step);
+            self.anchor_line = Some(self.log_line_of(new_cur));
+            self.view_top = self.render_top_of(self.anchor_line.unwrap());
+        }
     }
 
     /// 下滑查看较新的历史；回到底部时恢复跟随最新
@@ -1426,13 +1450,22 @@ impl Engine {
         if self.follow {
             return;
         }
-        let total = self.render_total();
-        let vis = self.out_height.max(1);
-        let max_top = total.saturating_sub(vis);
-        self.view_top = (self.view_top + step).min(max_top);
-        if self.view_top >= max_top {
-            self.follow = true;
-            self.view_top = 0;
+        // 按渲染行步长下移，锚点换算回日志行索引
+        if let Some(anchor) = self.anchor_line {
+            let cur = self.render_top_of(anchor);
+            let new_cur = cur + step;
+            let total = self.render_total();
+            let vis = self.out_height.max(1);
+            let max_top = total.saturating_sub(vis);
+            if new_cur >= max_top {
+                // 到达底部：恢复跟随
+                self.follow = true;
+                self.anchor_line = None;
+                self.view_top = 0;
+            } else {
+                self.anchor_line = Some(self.log_line_of(new_cur));
+                self.view_top = self.render_top_of(self.anchor_line.unwrap());
+            }
         }
     }
 
@@ -1638,6 +1671,7 @@ impl Engine {
                 self.render_rows.clear();
                 self.follow = true;
                 self.view_top = 0;
+                self.anchor_line = None;
                 // 清空搜索状态
                 self.search_kw = None;
                 self.search_matches.clear();
@@ -1843,12 +1877,14 @@ impl Engine {
             ":tail" | ":live" | ":follow" => {
                 self.follow = true;
                 self.view_top = 0;
+                self.anchor_line = None;
                 self.push_line(Dir::Sys, "已回到最新输出");
             }
             ":top" => {
                 // 一键回到输出最顶部（最早记录），进入锚定模式
                 self.follow = false;
                 self.view_top = 0;
+                self.anchor_line = Some(0);
                 self.push_line(Dir::Sys, "已回到输出顶部");
             }
             ":search" | ":find" => {
@@ -2040,6 +2076,7 @@ impl Engine {
     fn goto_bottom(&mut self) {
         self.follow = true;
         self.view_top = 0;
+        self.anchor_line = None;
     }
 
     /// 在输出区历史中搜索包含关键词的行，并跳到指定匹配位置。
@@ -2115,6 +2152,7 @@ impl Engine {
         let match_line = matches[target_idx];
         self.follow = false;
         self.view_top = self.render_top_of(match_line);
+        self.anchor_line = Some(match_line);
         self.push_line(
             Dir::Sys,
             format!(
@@ -2136,6 +2174,19 @@ impl Engine {
             .sum()
     }
 
+    /// 反推：渲染行索引 `render_row` 属于哪条日志行。
+    /// 用于锚定时把当前视口顶部的渲染行换算成日志行索引。
+    fn log_line_of(&self, render_row: usize) -> usize {
+        let mut acc = 0usize;
+        for (i, r) in self.render_rows.iter().enumerate() {
+            if acc + r.len() > render_row {
+                return i;
+            }
+            acc += r.len();
+        }
+        self.render_rows.len().saturating_sub(1)
+    }
+
     /// 在搜索结果之间跳转（↑/↓ 时由 handle_key 调用）
     fn search_jump(&mut self, delta: i32) {
         if self.search_matches.is_empty() {
@@ -2147,6 +2198,7 @@ impl Engine {
         let match_line = self.search_matches[self.search_pos];
         self.follow = false;
         self.view_top = self.render_top_of(match_line);
+        self.anchor_line = Some(match_line);
         self.push_line(
             Dir::Sys,
             format!(
@@ -2308,6 +2360,12 @@ impl Engine {
             }
             while self.render_rows.len() > self.lines.len() {
                 self.render_rows.pop_front();
+                // 防御性同步：若渲染缓存比日志长（异常残留），头部 pop 时同步锚点
+                if !self.follow
+                    && let Some(anchor) = &mut self.anchor_line
+                {
+                    *anchor = anchor.saturating_sub(1);
+                }
             }
         }
 
@@ -2315,6 +2373,11 @@ impl Engine {
         let total = self.render_total();
         let start = if self.follow {
             total.saturating_sub(inner_vis)
+        } else if let Some(anchor) = self.anchor_line {
+            // 锚定到日志行：由日志行索引换算回渲染行，保证头部 pop / 折行变化不漂移
+            let line = anchor.min(self.lines.len().saturating_sub(1));
+            self.render_top_of(line)
+                .min(total.saturating_sub(inner_vis))
         } else {
             self.view_top.min(total.saturating_sub(inner_vis))
         };
