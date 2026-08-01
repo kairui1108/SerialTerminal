@@ -17,3 +17,6 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# IDE 辅助数据
+.codebuddy/
