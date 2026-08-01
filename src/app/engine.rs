@@ -7,7 +7,7 @@ use crate::serial::port::{PortDevice, PortParams, list_ports};
 use crate::term::ansi;
 use crate::term::ui::Theme;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::prelude::*;
@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -467,7 +467,8 @@ pub struct Engine {
     tx_bytes: u64,
 
     // 日志文件
-    log: Option<File>,
+    /// 日志文件（带缓冲：高频 RX 写入不立即刷盘，避免同步磁盘 IO 阻塞主循环）
+    log: Option<BufWriter<File>>,
 
     // ---- 断线自动重连 ----
     /// 断开后尝试重连的目标端口（None 表示不自动重连）
@@ -549,7 +550,10 @@ impl Engine {
         let keep_input = cli.keep_input;
         let no_tags = cli.no_tags;
 
-        let (rx_tx, rx_events) = unbounded();
+        // RX 事件通道用有界容量：设备高速输出时读线程产生数据远快于主循环消费，
+        // 无界通道会无限堆积导致内存增长并占满主循环（输出卡顿 + 命令输入失效）。
+        // 有界通道配合读线程 send_timeout 背压，让主循环有窗口响应输入事件。
+        let (rx_tx, rx_events) = bounded::<SerialEvent>(512);
         let (tx_sender, _) = unbounded::<Vec<u8>>();
         let (tx_result_tx, tx_results) = unbounded();
         let textarea = TextArea::default();
@@ -708,18 +712,36 @@ impl Engine {
                     _ => {}
                 }
             }
-            while let Ok(ev) = self.rx_events.try_recv() {
-                match ev {
-                    SerialEvent::Data(b) => self.handle_rx_data(b),
-                    SerialEvent::Replay(dir, body) => self.push_line(dir, body),
-                    SerialEvent::Error(e) => {
-                        self.push_line(Dir::Err, format!("{}（已断开）", e));
-                        // 触发断线自动重连（若已设置 reconnect_port）
-                        if self.reconnect_port.is_some() && self.connected {
-                            self.connected = false;
-                            self.next_reconnect = Some(Instant::now());
+            // 每帧最多消费 MAX_RX_PER_FRAME 条 RX 事件，避免一次处理全部积压
+            // 导致本帧输入事件（poll/read）长时间得不到响应（命令输入失效）。
+            // 剩余积压留到下一帧处理；读线程的 send_timeout 背压会自动降载。
+            const MAX_RX_PER_FRAME: usize = 256;
+            let mut rx_consumed = 0usize;
+            while rx_consumed < MAX_RX_PER_FRAME {
+                match self.rx_events.try_recv() {
+                    Ok(ev) => {
+                        rx_consumed += 1;
+                        match ev {
+                            SerialEvent::Data(b) => self.handle_rx_data(b),
+                            SerialEvent::Replay(dir, body) => self.push_line(dir, body),
+                            SerialEvent::Error(e) => {
+                                self.push_line(Dir::Err, format!("{}（已断开）", e));
+                                // 触发断线自动重连（若已设置 reconnect_port）
+                                if self.reconnect_port.is_some() && self.connected {
+                                    self.connected = false;
+                                    self.next_reconnect = Some(Instant::now());
+                                }
+                            }
+                            SerialEvent::Overflow(dropped) => self.push_line(
+                                Dir::Err,
+                                format!(
+                                    "数据积压，已丢弃 {} 块 RX 数据（设备输出过快或 UI 繁忙）",
+                                    dropped
+                                ),
+                            ),
                         }
                     }
+                    Err(_) => break,
                 }
             }
             while let Ok(res) = self.tx_results.try_recv() {
@@ -846,12 +868,30 @@ impl Engine {
         self.rx_handle = Some(thread::spawn(move || {
             let mut buf = [0u8; 4096];
             let mut err_count = 0u32;
+            let mut dropped = 0usize;
             while running.load(Ordering::Relaxed) {
                 match port.read(&mut buf) {
                     Ok(n) => {
                         err_count = 0;
                         if n > 0 {
-                            let _ = tx.send(SerialEvent::Data(buf[..n].to_vec()));
+                            // 有界通道背压：优先等待主循环消费（200ms），
+                            // 仍满则丢弃该块并提示，避免读线程永久阻塞或内存无限增长。
+                            use crossbeam_channel::{SendTimeoutError, TrySendError};
+                            match tx.send_timeout(
+                                SerialEvent::Data(buf[..n].to_vec()),
+                                Duration::from_millis(200),
+                            ) {
+                                Ok(()) => {}
+                                Err(SendTimeoutError::Timeout(ev)) => match tx.try_send(ev) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(_)) => {
+                                        dropped += 1;
+                                        let _ = tx.try_send(SerialEvent::Overflow(dropped));
+                                    }
+                                    Err(TrySendError::Disconnected(_)) => break,
+                                },
+                                Err(SendTimeoutError::Disconnected(_)) => break,
+                            }
                         }
                     }
                     // 空闲超时是正常现象：read 阻塞到 timeout 后返回
@@ -1202,6 +1242,11 @@ impl Engine {
         self.lines.push_back(line);
         while self.lines.len() > 10_000 {
             self.lines.pop_front();
+            // 关键：同步弹出对应的渲染缓存行。若不同步，lines 达到上限后
+            // 长度不再变化但内容前移，draw 中 "render_rows.len() == lines.len()"
+            // 的增量补齐判断会失效，导致新行永远不进入 render_rows，输出区卡住
+            // 不显示新数据（RX 仍增长），只有 :clear 清空两者才能恢复。
+            self.render_rows.pop_front();
         }
         self.dirty = true;
     }
@@ -1844,7 +1889,7 @@ impl Engine {
                     match File::create(&path) {
                         Ok(f) => {
                             self.push_line(Dir::Sys, format!("日志已开启 -> {}", path.display()));
-                            self.log = Some(f);
+                            self.log = Some(BufWriter::new(f));
                         }
                         Err(e) => self.push_line(Dir::Err, format!("创建日志失败: {}", e)),
                     }

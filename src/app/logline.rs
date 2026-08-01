@@ -21,21 +21,24 @@ pub struct LogLine {
 /// 未完成行暂存 pending，超时后强制刷行。
 pub struct LineAssembler {
     pending: String,
-    last_activity: Option<Instant>,
+    /// 最近一次产生输出（切出完整行或刷出 pending）的时间，用于流式超时刷行
+    last_flushed: Instant,
+    /// pending 超过该字节数时即使未到超时也强制刷出，防止持续无换行数据流无限增长
+    max_pending: usize,
 }
 
 impl LineAssembler {
     pub fn new() -> Self {
         Self {
             pending: String::new(),
-            last_activity: None,
+            last_flushed: Instant::now(),
+            max_pending: 16 * 1024,
         }
     }
 
     /// 输入解码后的文本，返回完整行（不含行尾换行）
     pub fn push(&mut self, text: &str, now: Instant) -> Vec<String> {
         self.pending.push_str(text);
-        self.last_activity = Some(now);
         let mut out = Vec::new();
         // 单趟切分：仅对含换行的前缀做 split_inclusive，剩余部分留在 pending。
         // 避免原实现反复 drain(..=idx) 导致的 O(n²) 字符移位。
@@ -52,19 +55,24 @@ impl LineAssembler {
                 out.push(line.to_string());
             }
             self.pending = tail;
+            // 本次成功切出了完整行，刷新"上次输出"时间（pending 剩余是正常的未完成半行）
+            self.last_flushed = now;
         }
         out
     }
 
-    /// 若半行超时未完成，则强制刷出
+    /// 刷出待处理数据。触发条件：距上次产生输出已超过 `flush_ms`，或 pending
+    /// 超过 `max_pending`（防止持续无换行数据流无限累积）。
+    /// 注意：判定基于"距上次输出"而非"距上次输入"，否则持续流入的数据流会
+    /// 不断刷新时间戳导致 pending 永不刷出（RX 增长但输出区不显示）。
     pub fn take_pending_if_stale(&mut self, flush_ms: u64, now: Instant) -> Option<String> {
         if self.pending.is_empty() {
             return None;
         }
-        let stale = self
-            .last_activity
-            .is_none_or(|t| now.duration_since(t).as_millis() as u64 >= flush_ms);
-        if stale {
+        let idle = now.duration_since(self.last_flushed).as_millis() as u64 >= flush_ms;
+        let overlong = self.pending.len() >= self.max_pending;
+        if idle || overlong {
+            self.last_flushed = now;
             Some(std::mem::take(&mut self.pending))
         } else {
             None
@@ -130,10 +138,12 @@ mod tests {
         let mut a = LineAssembler::new();
         let t0 = Instant::now();
         a.push("half", t0);
+        // 距上次输出未到 flush_ms：不刷出
         assert!(a.take_pending_if_stale(200, t0).is_none());
-        assert!(
-            a.take_pending_if_stale(200, t0 + Duration::from_millis(250))
-                .is_some()
+        // 超过 flush_ms：刷出
+        assert_eq!(
+            a.take_pending_if_stale(200, t0 + Duration::from_millis(250)),
+            Some("half".to_string())
         );
     }
 
@@ -151,9 +161,37 @@ mod tests {
         let flushed = a.take_pending_if_stale(200, t0 + Duration::from_millis(300));
         assert_eq!(flushed, Some("data".to_string()));
         // 刷出后无遗留
-        assert!(
-            a.take_pending_if_stale(200, t0 + Duration::from_millis(500))
-                .is_none()
-        );
+        assert!(a.take_pending_if_stale(200, t0 + Duration::from_millis(500)).is_none());
+    }
+
+    /// 核心修复：持续无换行的数据流（每次 push 时间戳不断刷新）也应周期性刷出，
+    /// 否则 RX 计数持续增长但 pending 永不刷出（输出区不显示）。
+    #[test]
+    fn continuous_stream_flushed_periodically() {
+        let mut a = LineAssembler::new();
+        let t0 = Instant::now();
+        // 模拟持续数据流：每 50ms 推入一块无换行数据，200ms 内刷出一次
+        for i in 0..6 {
+            let t = t0 + Duration::from_millis(i * 50);
+            a.push("stream", t);
+        }
+        // 距上次输出（切行/刷出）超过 200ms 时应刷出当前累积数据
+        let flushed = a.take_pending_if_stale(200, t0 + Duration::from_millis(300));
+        assert!(flushed.is_some(), "持续数据流应周期性刷出");
+        assert_eq!(flushed.unwrap(), "streamstreamstreamstreamstreamstream");
+        // 刷出后 pending 清空
+        assert!(a.take_pending_if_stale(200, t0 + Duration::from_millis(500)).is_none());
+    }
+
+    /// 超过 max_pending 长度时即使未到超时也强制刷出，防止内存无限增长
+    #[test]
+    fn overlong_pending_force_flushed() {
+        let mut a = LineAssembler::new();
+        let t0 = Instant::now();
+        let big = "x".repeat(16 * 1024 + 100);
+        a.push(&big, t0);
+        // 未到 flush_ms，但 pending 超长：立即刷出
+        let flushed = a.take_pending_if_stale(200, t0 + Duration::from_millis(50));
+        assert_eq!(flushed, Some(big));
     }
 }
