@@ -161,7 +161,10 @@ mod tests {
         let flushed = a.take_pending_if_stale(200, t0 + Duration::from_millis(300));
         assert_eq!(flushed, Some("data".to_string()));
         // 刷出后无遗留
-        assert!(a.take_pending_if_stale(200, t0 + Duration::from_millis(500)).is_none());
+        assert!(
+            a.take_pending_if_stale(200, t0 + Duration::from_millis(500))
+                .is_none()
+        );
     }
 
     /// 核心修复：持续无换行的数据流（每次 push 时间戳不断刷新）也应周期性刷出，
@@ -180,7 +183,10 @@ mod tests {
         assert!(flushed.is_some(), "持续数据流应周期性刷出");
         assert_eq!(flushed.unwrap(), "streamstreamstreamstreamstreamstream");
         // 刷出后 pending 清空
-        assert!(a.take_pending_if_stale(200, t0 + Duration::from_millis(500)).is_none());
+        assert!(
+            a.take_pending_if_stale(200, t0 + Duration::from_millis(500))
+                .is_none()
+        );
     }
 
     /// 超过 max_pending 长度时即使未到超时也强制刷出，防止内存无限增长
